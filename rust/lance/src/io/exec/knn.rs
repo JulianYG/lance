@@ -56,6 +56,7 @@ use lance_index::vector::{
 };
 use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
+use lance_select::RowAddrMask;
 use lance_table::format::IndexMetadata;
 use tokio::sync::Notify;
 use uuid::Uuid;
@@ -67,6 +68,7 @@ use crate::index::vector::utils::{get_vector_type, validate_distance_type_for};
 use crate::{Error, Result};
 use lance_arrow::*;
 
+use super::row_addr_mask::MaskAndLoader;
 use super::utils::{
     FilteredRowIdsToPrefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter, PreFilterSource,
     SelectionVectorToPrefilter,
@@ -1104,6 +1106,7 @@ pub fn new_knn_exec(
     indices: &[IndexMetadata],
     query: &Query,
     prefilter_source: PreFilterSource,
+    external_mask: Option<Arc<RowAddrMask>>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let ivf_node = ANNIvfPartitionExec::try_new(
         dataset.clone(),
@@ -1117,6 +1120,7 @@ pub fn new_knn_exec(
         indices.to_vec(),
         query.clone(),
         prefilter_source,
+        external_mask,
     )?;
 
     Ok(Arc::new(sub_index))
@@ -1377,6 +1381,10 @@ pub struct ANNIvfSubIndexExec {
     /// Prefiltering input
     prefilter_source: PreFilterSource,
 
+    /// Optional external row-address allow/block mask, combined with the
+    /// prefilter using logical AND.
+    external_mask: Option<Arc<RowAddrMask>>,
+
     /// Datafusion Plan Properties
     properties: Arc<PlanProperties>,
 
@@ -1390,6 +1398,7 @@ impl ANNIvfSubIndexExec {
         indices: Vec<IndexMetadata>,
         query: Query,
         prefilter_source: PreFilterSource,
+        external_mask: Option<Arc<RowAddrMask>>,
     ) -> Result<Self> {
         if input.schema().field_with_name(PART_ID_COLUMN).is_err() {
             return Err(Error::index(format!(
@@ -1409,6 +1418,7 @@ impl ANNIvfSubIndexExec {
             indices,
             query,
             prefilter_source,
+            external_mask,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
@@ -1880,6 +1890,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                 indices: self.indices.clone(),
                 query: self.query.clone(),
                 prefilter_source,
+                external_mask: self.external_mask.clone(),
                 properties: self.properties.clone(),
                 metrics: ExecutionPlanMetricsSet::new(),
             }
@@ -1958,6 +1969,14 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                 Some(Box::new(SelectionVectorToPrefilter(stream)) as Box<dyn FilterLoader>)
             }
             PreFilterSource::None => None,
+        };
+
+        // AND the external row-address mask into whatever the filter produced.
+        let prefilter_loader = match self.external_mask.clone() {
+            Some(mask) => {
+                Some(Box::new(MaskAndLoader::new(mask, prefilter_loader)) as Box<dyn FilterLoader>)
+            }
+            None => prefilter_loader,
         };
 
         let pre_filter = Arc::new(DatasetPreFilter::new(

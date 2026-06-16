@@ -31,6 +31,7 @@ use lance_core::{
     utils::{tokio::get_num_compute_intensive_cpus, tracing::StreamTracingExt},
 };
 use lance_datafusion::utils::{ExecutionPlanMetricsSetExt, MetricsExt, PARTITIONS_SEARCHED_METRIC};
+use lance_select::RowAddrMask;
 use lance_table::format::IndexMetadata;
 
 use super::PreFilterSource;
@@ -238,6 +239,9 @@ pub struct MatchQueryExec {
     /// When set, `execute()` skips `load_segments` and searches exactly these
     /// segments.
     preset_segments: Option<Vec<IndexMetadata>>,
+    /// Optional external row-address mask combined (logical AND) with the BM25 prefilter so only
+    /// masked rows are scored (see [`Self::with_external_mask`]).
+    external_mask: Option<Arc<RowAddrMask>>,
 
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
@@ -296,6 +300,7 @@ impl MatchQueryExec {
             prefilter_source,
             base_scorer: None,
             preset_segments: None,
+            external_mask: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -331,6 +336,7 @@ impl MatchQueryExec {
             prefilter_source,
             base_scorer: None,
             preset_segments: Some(segments),
+            external_mask: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -350,6 +356,14 @@ impl MatchQueryExec {
     /// for constructing one.
     pub fn with_base_scorer(mut self, scorer: Arc<MemBM25Scorer>) -> Self {
         self.base_scorer = Some(scorer);
+        self
+    }
+
+    /// Restrict BM25 scoring to rows selected by an external row-address mask.
+    /// The mask is combined (logical AND) with the prefilter (see [`build_prefilter`]) so top-k is
+    /// computed over masked rows only. No-op when `mask` is `None`.
+    pub fn with_external_mask(mut self, mask: Option<Arc<RowAddrMask>>) -> Self {
+        self.external_mask = mask;
         self
     }
 
@@ -418,6 +432,7 @@ impl ExecutionPlan for MatchQueryExec {
                     prefilter_source: PreFilterSource::None,
                     base_scorer: self.base_scorer.clone(),
                     preset_segments: self.preset_segments.clone(),
+                    external_mask: self.external_mask.clone(),
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
                 }
@@ -445,6 +460,7 @@ impl ExecutionPlan for MatchQueryExec {
                     prefilter_source,
                     base_scorer: self.base_scorer.clone(),
                     preset_segments: self.preset_segments.clone(),
+                    external_mask: self.external_mask.clone(),
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
                 }
@@ -468,6 +484,7 @@ impl ExecutionPlan for MatchQueryExec {
         let params = self.params.clone();
         let ds = self.dataset.clone();
         let prefilter_source = self.prefilter_source.clone();
+        let external_mask = self.external_mask.clone();
         let preset_base_scorer = self.base_scorer.clone();
         let preset_segments = self.preset_segments.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
@@ -490,8 +507,14 @@ impl ExecutionPlan for MatchQueryExec {
             let indices =
                 open_fts_segments(&ds, &column, &segments, &metrics.index_metrics).await?;
 
-            let mut pre_filter =
-                build_prefilter(context.clone(), partition, &prefilter_source, ds, &segments)?;
+            let mut pre_filter = build_prefilter(
+                context.clone(),
+                partition,
+                &prefilter_source,
+                ds,
+                &segments,
+                external_mask,
+            )?;
             let deleted_fragments =
                 indices
                     .iter()
@@ -1155,6 +1178,9 @@ pub struct PhraseQueryExec {
     /// Optional pre-resolved segment list. See
     /// [`MatchQueryExec::new_with_segments`].
     preset_segments: Option<Vec<IndexMetadata>>,
+    /// Optional external row-address mask combined (logical AND) with the BM25 prefilter so only
+    /// masked rows are scored (see [`MatchQueryExec::with_external_mask`]).
+    external_mask: Option<Arc<RowAddrMask>>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -1204,6 +1230,7 @@ impl PhraseQueryExec {
             prefilter_source,
             base_scorer: None,
             preset_segments: None,
+            external_mask: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -1232,6 +1259,7 @@ impl PhraseQueryExec {
             prefilter_source,
             base_scorer: None,
             preset_segments: Some(segments),
+            external_mask: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -1240,6 +1268,12 @@ impl PhraseQueryExec {
     /// Override the local BM25 scorer; see [`MatchQueryExec::with_base_scorer`].
     pub fn with_base_scorer(mut self, scorer: Arc<MemBM25Scorer>) -> Self {
         self.base_scorer = Some(scorer);
+        self
+    }
+
+    /// See [`MatchQueryExec::with_external_mask`].
+    pub fn with_external_mask(mut self, mask: Option<Arc<RowAddrMask>>) -> Self {
+        self.external_mask = mask;
         self
     }
 
@@ -1301,6 +1335,7 @@ impl ExecutionPlan for PhraseQueryExec {
                 prefilter_source: PreFilterSource::None,
                 base_scorer: self.base_scorer.clone(),
                 preset_segments: self.preset_segments.clone(),
+                external_mask: self.external_mask.clone(),
                 properties: self.properties.clone(),
                 metrics: ExecutionPlanMetricsSet::new(),
             },
@@ -1326,6 +1361,7 @@ impl ExecutionPlan for PhraseQueryExec {
                     prefilter_source,
                     base_scorer: self.base_scorer.clone(),
                     preset_segments: self.preset_segments.clone(),
+                    external_mask: self.external_mask.clone(),
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
                 }
@@ -1349,6 +1385,7 @@ impl ExecutionPlan for PhraseQueryExec {
         let params = self.params.clone();
         let ds = self.dataset.clone();
         let prefilter_source = self.prefilter_source.clone();
+        let external_mask = self.external_mask.clone();
         let preset_base_scorer = self.base_scorer.clone();
         let preset_segments = self.preset_segments.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
@@ -1371,8 +1408,14 @@ impl ExecutionPlan for PhraseQueryExec {
             let indices =
                 open_fts_segments(&ds, &column, &segments, &metrics.index_metrics).await?;
 
-            let mut pre_filter =
-                build_prefilter(context.clone(), partition, &prefilter_source, ds, &segments)?;
+            let mut pre_filter = build_prefilter(
+                context.clone(),
+                partition,
+                &prefilter_source,
+                ds,
+                &segments,
+                external_mask,
+            )?;
             let deleted_fragments =
                 indices
                     .iter()
