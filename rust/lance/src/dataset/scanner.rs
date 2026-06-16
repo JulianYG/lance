@@ -53,7 +53,9 @@ use lance_core::datatypes::{
 };
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
+// Re-exported so callers of `Scanner::with_row_addr_prefilter` can name the mask
+// type without depending on `lance-core` directly.
+pub use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ID, ROW_OFFSET};
 use lance_datafusion::aggregate::Aggregate;
@@ -97,7 +99,7 @@ use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
 use crate::io::exec::{
     AddRowAddrExec, FilterPlan as ExprFilterPlan, KNNVectorDistanceExec, LancePushdownScanExec,
-    LanceScanExec, Planner, PreFilterSource, ScanConfig, TakeExec,
+    LanceScanExec, Planner, PreFilterSource, RowAddrMaskFilterExec, ScanConfig, TakeExec,
     knn::{KNN_INDEX_SCHEMA, new_knn_exec},
     project,
 };
@@ -727,6 +729,14 @@ pub struct Scanner {
     /// If true then the filter will be applied before an index scan
     prefilter: bool,
 
+    /// Optional external allow/block mask keyed in `_rowid` space. On a vector
+    /// search it is combined with the index-side prefilter and applied to the
+    /// flat branch for fragments not covered by the index; on a plain scan it is
+    /// the row source (see `use_external_mask`). Held behind an Arc so cloning it
+    /// into the ANN sub-plans and the flat-branch filter is cheap regardless of
+    /// mask size.
+    external_row_mask: Option<Arc<RowAddrMask>>,
+
     /// Materialization style controls when columns are fetched
     materialization_style: MaterializationStyle,
 
@@ -1009,6 +1019,7 @@ impl Scanner {
             projection_plan,
             blob_handling: BlobHandling::default(),
             prefilter: false,
+            external_row_mask: None,
             materialization_style: MaterializationStyle::Heuristic,
             filter: LanceFilter::default(),
             full_text_query: None,
@@ -1166,6 +1177,47 @@ impl Scanner {
     /// results do not match the filter.
     pub fn prefilter(&mut self, should_prefilter: bool) -> &mut Self {
         self.prefilter = should_prefilter;
+        self
+    }
+
+    /// Set an external [`RowAddrMask`] allow/block prefilter.
+    ///
+    /// Build the mask with [`RowAddrMask::from_allowed`] to keep only the listed
+    /// rows or [`RowAddrMask::from_block`] to drop them. On a vector
+    /// ([`nearest`](Self::nearest)) search the mask is combined with any
+    /// filter-derived prefilter on the index branch and applied to the flat
+    /// branch for fragments not covered by the vector index. On a
+    /// [`full_text_search`](Self::full_text_search) (match or phrase query) the
+    /// mask is combined into the FTS prefilter so BM25 top-k is computed over
+    /// masked rows, and the flat branch that scores unindexed fragments
+    /// (plan_flat_match_query) is masked with RowAddrMaskFilterExec. On a plain
+    /// scan the mask is used directly as the row source, with any
+    /// [`filter`](Self::filter) applied as a refine on top.
+    ///
+    /// The mask is keyed in the dataset's `_rowid` space, so build it from the
+    /// same dataset you query. That space is the row address when stable row ids
+    /// are disabled and the stable row id when they are enabled; both are handled
+    /// (index prefilter and filtered read branch on `uses_stable_row_ids`), so no
+    /// caller-side translation is needed either way.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use lance::dataset::Dataset;
+    /// # async fn example(dataset: &Dataset) -> lance::Result<()> {
+    /// use lance::dataset::scanner::{RowAddrMask, RowAddrTreeMap};
+    ///
+    /// // Restrict the scan to rows whose _rowid is 0, 2, or 4.
+    /// let mask = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([0u64, 2, 4]));
+    /// let mut scanner = dataset.scan();
+    /// scanner.with_row_addr_prefilter(mask);
+    /// let batch = scanner.try_into_batch().await?;
+    /// # let _ = batch;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_row_addr_prefilter(&mut self, mask: RowAddrMask) -> &mut Self {
+        self.external_row_mask = Some(Arc::new(mask));
         self
     }
 
@@ -2732,6 +2784,32 @@ impl Scanner {
         })
     }
 
+    // A plain-scan external row mask is fed as the FilteredReadExec row source so
+    // only masked rows are read, with any SQL filter applied as a refine on top.
+    // Vector and full-text searches apply the mask via their own prefilter paths
+    // (KNN external_mask / FTS build_prefilter), so this plain-scan source is
+    // scoped to scans that are neither. FTS in particular has nearest.is_none(),
+    // so excluding it here keeps the FTS prefilter's own filtered read unmasked.
+    fn use_external_mask(&self) -> bool {
+        self.nearest.is_none() && self.full_text_query.is_none() && self.external_row_mask.is_some()
+    }
+
+    // The filter plan actually handed to the filtered read. With an external mask
+    // active the mask is the row source, so any SQL filter is demoted to a refine
+    // on top of it; otherwise the plan is used as-is. Projection and scan-range
+    // planning must be done against this, not the raw filter_plan, so refine
+    // columns are retained and limit/offset is not pushed down before masking.
+    fn effective_filter_plan(&self, filter_plan: &ExprFilterPlan) -> ExprFilterPlan {
+        if self.use_external_mask() {
+            match filter_plan.full_expr.clone() {
+                Some(expr) => ExprFilterPlan::new_refine_only(expr),
+                None => ExprFilterPlan::default(),
+            }
+        } else {
+            filter_plan.clone()
+        }
+    }
+
     // Helper function for filtered_read
     //
     // Do not call this directly, use filtered_read instead
@@ -2743,8 +2821,11 @@ impl Scanner {
         fragments: Option<Arc<Vec<Fragment>>>,
         scan_range: Option<Range<u64>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let use_external_mask = self.use_external_mask();
+        let effective_filter = self.effective_filter_plan(filter_plan);
+
         let mut read_options = FilteredReadOptions::basic_full_read(&self.dataset)
-            .with_filter_plan(filter_plan.clone())
+            .with_filter_plan(effective_filter)
             .with_projection(projection);
 
         if let Some(fragments) = fragments {
@@ -2775,10 +2856,13 @@ impl Scanner {
             read_options = read_options.with_io_buffer_size(io_buffer_size_bytes);
         }
 
-        let index_input = filter_plan.index_query.clone().map(|index_query| {
-            Arc::new(ScalarIndexExec::new(self.dataset.clone(), index_query))
-                as Arc<dyn ExecutionPlan>
-        });
+        let index_input = match self.external_row_mask.as_deref() {
+            Some(mask) if use_external_mask => Some(self.mask_as_index_input(mask)?),
+            _ => filter_plan.index_query.clone().map(|index_query| {
+                Arc::new(ScalarIndexExec::new(self.dataset.clone(), index_query))
+                    as Arc<dyn ExecutionPlan>
+            }),
+        };
 
         Ok(Arc::new(FilteredReadExec::try_new(
             self.dataset.clone(),
@@ -2801,6 +2885,19 @@ impl Scanner {
     ) -> Result<PlannedFilteredScan> {
         // Use legacy path if dataset uses legacy storage format
         if self.dataset.is_legacy_storage() {
+            // The plain-scan mask path lives in new_filtered_read; legacy_filtered_read
+            // has no equivalent, so a masked plain scan here would silently drop the
+            // mask and return every row. Fail loudly instead. Vector and full-text
+            // searches apply the mask via their own prefilter paths (ANN prefilter /
+            // FTS build_prefilter) plus the RowAddrMaskFilterExec flat wrap, so they
+            // are unaffected -- use_external_mask() is false for them.
+            if self.use_external_mask() {
+                return Err(Error::not_supported(
+                    "with_row_addr_prefilter is not supported for plain scans on \
+                     legacy-storage datasets"
+                        .to_string(),
+                ));
+            }
             self.legacy_filtered_read(
                 filter_plan,
                 projection,
@@ -2829,10 +2926,12 @@ impl Scanner {
         }
     }
 
-    fn u64s_as_take_input(&self, u64s: Vec<u64>) -> Result<Arc<dyn ExecutionPlan>> {
-        let row_addrs = RowAddrTreeMap::from_iter(u64s);
-        let row_addr_mask = RowAddrMask::from_allowed(row_addrs);
-        let index_result = IndexExprResult::Exact(row_addr_mask);
+    // Wrap an evaluated index result as a one-shot index input for
+    // FilteredReadExec.
+    fn index_result_as_index_input(
+        &self,
+        index_result: IndexExprResult,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         let fragments_covered = self.dataset.fragment_bitmap.as_ref().clone();
         let batch = index_result.serialize_to_arrow(&fragments_covered)?;
         let stream = futures::stream::once(async move { Ok(batch) });
@@ -2841,6 +2940,17 @@ impl Scanner {
             stream,
         ));
         Ok(Arc::new(OneShotExec::new(stream)))
+    }
+
+    // Wrap an external row-address mask as a one-shot index input for
+    // FilteredReadExec, so a plain scan reads only the masked rows.
+    fn mask_as_index_input(&self, mask: &RowAddrMask) -> Result<Arc<dyn ExecutionPlan>> {
+        self.index_result_as_index_input(IndexExprResult::Exact(mask.clone()))
+    }
+
+    fn u64s_as_take_input(&self, u64s: Vec<u64>) -> Result<Arc<dyn ExecutionPlan>> {
+        let row_addr_mask = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(u64s));
+        self.index_result_as_index_input(IndexExprResult::Exact(row_addr_mask))
     }
 
     async fn take_source(&self, take_op: TakeOperation) -> Result<Arc<dyn ExecutionPlan>> {
@@ -2896,11 +3006,15 @@ impl Scanner {
             self.projection_plan.physical_projection.clone()
         };
 
-        let mut projection = if filter_plan.has_refine() {
+        // Plan against the effective filter: with an external mask the SQL filter
+        // becomes a refine, so its columns must be retained even when the original
+        // plan resolved to an exact scalar-index query (has_refine() == false).
+        let effective_filter = self.effective_filter_plan(filter_plan);
+        let mut projection = if effective_filter.has_refine() {
             // If the filter plan has two steps (a scalar indexed portion and a refine portion) then
             // it makes sense to grab cheap columns during the first step to avoid taking them for
             // the second step.
-            self.calc_eager_projection(filter_plan, &effective_projection)?
+            self.calc_eager_projection(&effective_filter, &effective_projection)?
                 .with_row_id()
         } else {
             // If the filter plan only has one step then we just do a filtered read of all the
@@ -2914,7 +3028,11 @@ impl Scanner {
             projection.with_row_addr = true;
         }
 
-        let scan_range = if filter_plan.is_empty() {
+        // An external mask is applied as the row source inside new_filtered_read, so
+        // limit/offset must not be pushed down as a pre-mask range (that would limit
+        // rows before masking). Leaving scan_range None keeps limit_pushed_down false
+        // so the limit is applied by a node above the masked source instead.
+        let scan_range = if filter_plan.is_empty() && !self.use_external_mask() {
             log::trace!("pushing scan_range into filtered_read");
             self.get_scan_range(filter_plan).await?
         } else {
@@ -3344,12 +3462,15 @@ impl Scanner {
                 .to_string()));
         }
 
-        Ok(Arc::new(PhraseQueryExec::new(
-            self.dataset.clone(),
-            query.clone(),
-            params.clone(),
-            prefilter_source.clone(),
-        )))
+        Ok(Arc::new(
+            PhraseQueryExec::new(
+                self.dataset.clone(),
+                query.clone(),
+                params.clone(),
+                prefilter_source.clone(),
+            )
+            .with_external_mask(self.external_row_mask.clone()),
+        ))
     }
 
     async fn plan_match_query(
@@ -3396,12 +3517,15 @@ impl Scanner {
                 }
 
                 // Mixed case: use index + flat search for unindexed
-                let match_plan: Arc<dyn ExecutionPlan> = Arc::new(MatchQueryExec::new(
-                    self.dataset.clone(),
-                    query.clone(),
-                    params.clone(),
-                    prefilter_source.clone(),
-                ));
+                let match_plan: Arc<dyn ExecutionPlan> = Arc::new(
+                    MatchQueryExec::new(
+                        self.dataset.clone(),
+                        query.clone(),
+                        params.clone(),
+                        prefilter_source.clone(),
+                    )
+                    .with_external_mask(self.external_row_mask.clone()),
+                );
 
                 if self.fast_search || unindexed_fragments.is_empty() {
                     (Some(match_plan), None)
@@ -3488,12 +3612,19 @@ impl Scanner {
             scan_node = Arc::new(LanceFilterExec::try_new(expr.clone(), scan_node)?);
         }
 
-        let flat_match_plan = Arc::new(FlatMatchQueryExec::new(
+        let flat_match_plan: Arc<dyn ExecutionPlan> = Arc::new(FlatMatchQueryExec::new(
             self.dataset.clone(),
             query.clone(),
             params.clone(),
             scan_node,
         ));
+        // Unindexed fragments never reach the index-side prefilter, so apply the
+        // external row-address mask to the flat FTS results here (mirrors the ANN
+        // flat branch). Applied before the caller's top-k so masked-out rows do
+        // not consume result slots.
+        if let Some(mask) = self.external_row_mask.clone() {
+            return Ok(Arc::new(RowAddrMaskFilterExec::new(flat_match_plan, mask)));
+        }
         Ok(flat_match_plan)
     }
 
@@ -3722,6 +3853,11 @@ impl Scanner {
             if let Some(refine_expr) = &filter_plan.refine_expr {
                 plan = Arc::new(LanceFilterExec::try_new(refine_expr.clone(), plan)?);
             }
+            // The flat branch never reaches the index-side prefilter, so apply
+            // the external row-address mask here against the scanned _rowid.
+            if let Some(mask) = self.external_row_mask.clone() {
+                plan = Arc::new(RowAddrMaskFilterExec::new(plan, mask));
+            }
             Ok(self.flat_knn(plan, &q)?)
         }
     }
@@ -3790,6 +3926,11 @@ impl Scanner {
             if let Some(expr) = filter_plan.full_expr.as_ref() {
                 // If there is a prefilter we need to manually apply it to the new data
                 scan_node = Arc::new(LanceFilterExec::try_new(expr.clone(), scan_node)?);
+            }
+            // Appended fragments are not covered by the index, so the external
+            // row-address mask must be applied to them here.
+            if let Some(mask) = self.external_row_mask.clone() {
+                scan_node = Arc::new(RowAddrMaskFilterExec::new(scan_node, mask));
             }
             // first we do flat search on just the new data
             let topk_appended = self.flat_knn(scan_node, &q)?;
@@ -4406,7 +4547,13 @@ impl Scanner {
         let prefilter_source = self
             .prefilter_source(filter_plan, self.get_indexed_frags(index))
             .await?;
-        let inner_fanout_search = new_knn_exec(self.dataset.clone(), index, q, prefilter_source)?;
+        let inner_fanout_search = new_knn_exec(
+            self.dataset.clone(),
+            index,
+            q,
+            prefilter_source,
+            self.external_row_mask.clone(),
+        )?;
         let sort_expr = PhysicalSortExpr {
             expr: expressions::col(DIST_COL, inner_fanout_search.schema().as_ref())?,
             options: SortOptions {
@@ -4465,6 +4612,7 @@ impl Scanner {
                 index,
                 &query,
                 prefilter_source.clone(),
+                self.external_row_mask.clone(),
             )?;
             let sort_expr = PhysicalSortExpr {
                 expr: expressions::col(DIST_COL, ann_node.schema().as_ref())?,
@@ -5215,6 +5363,259 @@ mod test {
                 rows_read += next.num_rows();
             }
         }
+    }
+
+    fn batch_row_ids(batch: &RecordBatch) -> Vec<u64> {
+        batch
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_primitive::<UInt64Type>()
+            .values()
+            .to_vec()
+    }
+
+    #[rstest]
+    #[case::without_stable_row_ids(false)]
+    #[case::with_stable_row_ids(true)]
+    #[tokio::test]
+    async fn row_addr_mask_plain_scan_allow_block_refine(#[case] stable_row_ids: bool) {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, stable_row_ids)
+            .await
+            .unwrap();
+        let ds = &test_ds.dataset;
+
+        let mut scan = ds.scan();
+        scan.with_row_id();
+        let all_ids = batch_row_ids(&scan.try_into_batch().await.unwrap());
+        let all_set: BTreeSet<u64> = all_ids.iter().copied().collect();
+        let allow: Vec<u64> = all_ids.iter().copied().step_by(2).collect();
+        let allow_set: BTreeSet<u64> = allow.iter().copied().collect();
+
+        // Allow-mask plain scan returns exactly the allowed rows.
+        let mut scan = ds.scan();
+        scan.with_row_addr_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
+            allow.iter().copied(),
+        )));
+        scan.with_row_id();
+        let got: BTreeSet<u64> = batch_row_ids(&scan.try_into_batch().await.unwrap())
+            .into_iter()
+            .collect();
+        assert_eq!(got, allow_set);
+
+        // Block-mask plain scan returns every row except the blocked ones, which
+        // also exercises FilteredReadExec index-input serialization of a BlockList.
+        let block: Vec<u64> = all_ids.iter().copied().step_by(3).collect();
+        let block_set: BTreeSet<u64> = block.iter().copied().collect();
+        let mut scan = ds.scan();
+        scan.with_row_addr_prefilter(RowAddrMask::from_block(RowAddrTreeMap::from_iter(
+            block.iter().copied(),
+        )));
+        scan.with_row_id();
+        let got: BTreeSet<u64> = batch_row_ids(&scan.try_into_batch().await.unwrap())
+            .into_iter()
+            .collect();
+        let expected: BTreeSet<u64> = all_set.difference(&block_set).copied().collect();
+        assert_eq!(got, expected);
+
+        // With a SQL refine, the result is the allowed rows that also match the filter.
+        let mut scan = ds.scan();
+        scan.with_row_addr_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
+            allow.iter().copied(),
+        )));
+        scan.filter("i >= 200").unwrap();
+        scan.project(&["i"]).unwrap();
+        scan.with_row_id();
+        let refined = scan.try_into_batch().await.unwrap();
+        let refined_ids: BTreeSet<u64> = batch_row_ids(&refined).into_iter().collect();
+        assert!(refined_ids.is_subset(&allow_set) && !refined_ids.is_empty());
+        let is = refined
+            .column_by_name("i")
+            .unwrap()
+            .as_primitive::<Int32Type>();
+        assert!(is.values().iter().all(|v| *v >= 200));
+    }
+
+    #[tokio::test]
+    async fn row_addr_mask_plain_scan_rejected_on_legacy() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Legacy, false)
+            .await
+            .unwrap();
+        let ds = &test_ds.dataset;
+        let mut scan = ds.scan();
+        scan.with_row_addr_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([0u64])));
+        let Err(err) = scan.try_into_stream().await else {
+            panic!("expected legacy-storage masked plain scan to be rejected");
+        };
+        assert!(
+            err.to_string().contains("legacy-storage"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[rstest]
+    #[case::without_stable_row_ids(false)]
+    #[case::with_stable_row_ids(true)]
+    #[tokio::test]
+    async fn row_addr_mask_ann_search_only_allowed(#[case] stable_row_ids: bool) {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, stable_row_ids)
+            .await
+            .unwrap();
+        test_ds.make_vector_index().await.unwrap();
+        // Append after indexing so the appended fragment is unindexed (flat branch).
+        test_ds.append_new_data().await.unwrap();
+        let ds = &test_ds.dataset;
+
+        let mut scan = ds.scan();
+        scan.with_row_id();
+        let all_ids = batch_row_ids(&scan.try_into_batch().await.unwrap());
+        let allow: Vec<u64> = all_ids.iter().copied().step_by(3).collect();
+        let allow_set: BTreeSet<u64> = allow.iter().copied().collect();
+
+        let key: Float32Array = (0..32).map(|v| v as f32).collect();
+        let mut scan = ds.scan();
+        scan.nearest("vec", &key, 15).unwrap();
+        scan.with_row_addr_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
+            allow.iter().copied(),
+        )));
+        scan.with_row_id();
+        let got = batch_row_ids(&scan.try_into_batch().await.unwrap());
+        assert!(!got.is_empty());
+        for id in got {
+            assert!(
+                allow_set.contains(&id),
+                "returned _rowid {id} not in allowlist"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn row_addr_mask_plain_scan_with_limit() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        let ds = &test_ds.dataset;
+
+        let mut scan = ds.scan();
+        scan.with_row_id();
+        let all_ids = batch_row_ids(&scan.try_into_batch().await.unwrap());
+        let allow: Vec<u64> = all_ids.iter().copied().step_by(2).collect();
+        let allow_set: BTreeSet<u64> = allow.iter().copied().collect();
+
+        // limit must apply AFTER masking: 5 rows, all from the allowlist.
+        let mut scan = ds.scan();
+        scan.with_row_addr_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
+            allow.iter().copied(),
+        )));
+        scan.limit(Some(5), None).unwrap();
+        scan.with_row_id();
+        let got = batch_row_ids(&scan.try_into_batch().await.unwrap());
+        assert_eq!(got.len(), 5, "masked limit should yield 5 masked rows");
+        for id in &got {
+            assert!(allow_set.contains(id), "returned {id} not allowed");
+        }
+    }
+
+    #[tokio::test]
+    async fn row_addr_mask_plain_scan_filter_unprojected_column() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        let ds = &test_ds.dataset;
+
+        let mut scan = ds.scan();
+        scan.with_row_id();
+        let all_ids = batch_row_ids(&scan.try_into_batch().await.unwrap());
+
+        // Allow everything; filter on `i` but project only `s` (unrelated column).
+        let mut scan = ds.scan();
+        scan.with_row_addr_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
+            all_ids.iter().copied(),
+        )));
+        scan.filter("i >= 200").unwrap();
+        scan.project(&["s"]).unwrap();
+        let out = scan.try_into_batch().await.unwrap();
+        assert_eq!(out.num_rows(), 200, "expected 200 rows with i>=200");
+    }
+
+    #[tokio::test]
+    async fn row_addr_mask_plain_scan_exact_index_filter_unprojected_column() {
+        // A scalar index on `i` turns `i >= 200` into an exact index query with no
+        // refine. Under an external mask that predicate is demoted to a refine over
+        // the masked rows, so `i` must still be projected for the read even though
+        // the user only asked for `s`.
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        test_ds.make_scalar_index().await.unwrap();
+        let ds = &test_ds.dataset;
+
+        let mut scan = ds.scan();
+        scan.with_row_id();
+        let all_ids = batch_row_ids(&scan.try_into_batch().await.unwrap());
+
+        let mut scan = ds.scan();
+        scan.with_row_addr_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
+            all_ids.iter().copied(),
+        )));
+        scan.filter("i >= 200").unwrap();
+        scan.project(&["s"]).unwrap();
+        let out = scan.try_into_batch().await.unwrap();
+        assert_eq!(out.num_rows(), 200, "expected 200 rows with i>=200");
+    }
+
+    #[tokio::test]
+    async fn row_addr_mask_fts_search_only_allowed() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        test_ds.make_fts_index().await.unwrap();
+        // Re-append the low-i rows AFTER indexing so token "4" matches both an
+        // indexed row (index prefilter path) and an unindexed one (flat FTS branch).
+        test_ds.append_data_with_range(0, 10).await.unwrap();
+        let ds = &test_ds.dataset;
+
+        // Baseline: the row ids an unmasked FTS query matches.
+        let mut scan = ds.scan();
+        scan.full_text_search(FullTextSearchQuery::new("4".into()))
+            .unwrap();
+        scan.with_row_id();
+        let base_ids = batch_row_ids(&scan.try_into_batch().await.unwrap());
+        let base_set: BTreeSet<u64> = base_ids.iter().copied().collect();
+        assert!(
+            base_ids.len() >= 2,
+            "expected indexed + unindexed matches for token 4, got {base_ids:?}"
+        );
+
+        // Allow only every other matching row; the mask must prefilter BM25 so the
+        // result is exactly the allowed subset of the baseline matches.
+        let allow: Vec<u64> = base_ids.iter().copied().step_by(2).collect();
+        let allow_set: BTreeSet<u64> = allow.iter().copied().collect();
+
+        let mut scan = ds.scan();
+        scan.full_text_search(FullTextSearchQuery::new("4".into()))
+            .unwrap();
+        scan.with_row_addr_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
+            allow.iter().copied(),
+        )));
+        scan.with_row_id();
+        let got: BTreeSet<u64> = batch_row_ids(&scan.try_into_batch().await.unwrap())
+            .into_iter()
+            .collect();
+        let expected: BTreeSet<u64> = base_set.intersection(&allow_set).copied().collect();
+        assert_eq!(got, expected, "masked FTS must return allowed matches only");
+        assert!(!got.is_empty());
+
+        // Block every match -> empty, proving the mask actually filters FTS results
+        // on both the indexed and flat branches.
+        let mut scan = ds.scan();
+        scan.full_text_search(FullTextSearchQuery::new("4".into()))
+            .unwrap();
+        scan.with_row_addr_prefilter(RowAddrMask::from_block(RowAddrTreeMap::from_iter(
+            base_ids.iter().copied(),
+        )));
+        scan.with_row_id();
+        let blocked = batch_row_ids(&scan.try_into_batch().await.unwrap());
+        assert!(blocked.is_empty(), "block-mask must drop all FTS matches");
     }
 
     #[tokio::test]
